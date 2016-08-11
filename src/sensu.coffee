@@ -15,7 +15,7 @@
 #   hubot sensu remove stash <stash> - remove a stash from sensu
 #   hubot sensu clients - show all clients
 #   hubot sensu client <client>[ history] - show a specific client['s history]
-#   hubot sensu sensu remove client <client> - remove a client from sensu
+#   hubot sensu remove client <client> - remove a client from sensu
 #   hubot sensu events[ for <client>] - show all events or for a specific client
 #   hubot sensu resolve event <client>/<service> - resolve a sensu event
 #
@@ -31,7 +31,23 @@
 config =
   sensu_api: process.env.HUBOT_SENSU_API_URL
 
+if process.env.HUBOT_SENSU_AUTHORIZED_ROLES
+  authorizedRoles = process.env.HUBOT_SENSU_AUTHORIZED_ROLES
+else
+  authorizedRoles = 'admin,sensu_admin'
+
+
 moment = require('moment')
+
+hasAnAuthorizedRole = (robot, user) ->
+  for r in robot.auth.userRoles user
+    return true if r in authorizedRoles.split(',')
+  return false
+
+isAuthorized = (robot, user) ->
+  hasHubotAuth = robot.auth? and robot.auth.hasRole?
+  mustRestrictWithRoles = hasHubotAuth and authorizedRoles?
+  (not mustRestrictWithRoles) or hasAnAuthorizedRole robot, user
 
 module.exports = (robot) ->
 
@@ -72,6 +88,7 @@ module.exports = (robot) ->
 #######################
   robot.respond /(?:sensu)? stashes/i, (msg) ->
     validateVars
+
     robot.http(config.sensu_api + '/stashes')
       .get() (err, res, body) ->
         if err
@@ -131,14 +148,21 @@ module.exports = (robot) ->
     data['expire'] = expiration
     data['path'] = 'silence/' + path
 
-    robot.http(config.sensu_api + '/stashes')
-      .post(JSON.stringify(data)) (err, res, body) ->
-        if res.statusCode is 201
-          msg.send path + ' silenced for ' + human_d
-        else if res.statusCode is 400
-          msg.send 'API returned malformed error for path silence/' + path + '\ndata: ' + JSON.stringify(data)
-        else
-          msg.send "API returned an error for path silence/#{path}\ndata: #{JSON.stringify(data)}\nresponse:#{res.statusCode}: #{body}"
+    authorized = isAuthorized robot, msg.envelope.user
+
+    console.log "sensu: User: #{msg.message.user.name}, sensu silence path: #{path}, expiration: #{expiration}"
+
+    if authorized
+      robot.http(config.sensu_api + '/stashes')
+        .post(JSON.stringify(data)) (err, res, body) ->
+          if res.statusCode is 201
+            msg.send path + ' silenced for ' + human_d
+          else if res.statusCode is 400
+            msg.send 'API returned malformed error for path silence/' + path + '\ndata: ' + JSON.stringify(data)
+          else
+            msg.send "API returned an error for path silence/#{path}\ndata: #{JSON.stringify(data)}\nresponse:#{res.statusCode}: #{body}"
+    else
+      msg.reply "I can't do that, you need at least one of these roles: #{authorizedRoles}"
 
   robot.respond /(?:sensu)? remove stash (.*)/i, (msg) ->
     validateVars
@@ -151,17 +175,24 @@ module.exports = (robot) ->
     unless stash.match /^silence\/(.*)\//
       stash = addClientDomain(stash)
 
-    robot.http(config.sensu_api + '/stashes/' + stash)
-      .delete() (err, res, body) ->
-        if err
-          msg.send "Sensu says: #{err}"
-          return
-        if res.statusCode is 204
-          msg.send stash + ' removed'
-        else if res.statusCode is 404
-          msg.send stash + ' not found'
-        else
-          msg.send "API returned an error removing #{stash} (#{res.statusCode}: #{body})"
+    authorized = isAuthorized robot, msg.envelope.user
+
+    console.log "sensu: User: #{msg.message.user.name}, sensu remove stash #{stash}"
+
+    if authorized
+      robot.http(config.sensu_api + '/stashes/' + stash)
+        .delete() (err, res, body) ->
+          if err
+            msg.send "Sensu says: #{err}"
+            return
+          if res.statusCode is 204
+            msg.send stash + ' removed'
+          else if res.statusCode is 404
+            msg.send stash + ' not found'
+          else
+            msg.send "API returned an error removing #{stash} (#{res.statusCode}: #{body})"
+    else
+      msg.reply "I can't do that, you need at least one of these roles: #{authorizedRoles}"
 
 ########################
 #### Client methods ####
@@ -230,19 +261,25 @@ module.exports = (robot) ->
 
   robot.respond /(?:sensu)? remove client (.*)/i, (msg) ->
     validateVars
-    client= addClientDomain(msg.match[1])
+    client = addClientDomain(msg.match[1])
+    authorized = isAuthorized robot, msg.envelope.user
 
-    robot.http(config.sensu_api + '/clients/' + client)
-      .delete() (err, res, body) ->
-        if err
-          msg.send "Sensu says: #{err}"
-          return
-        if res.statusCode is 202
-          msg.send client + ' removed'
-        else if res.statusCode is 404
-          msg.send client + ' not found'
-        else
-          msg.send "API returned an error removing #{client} (#{res.statusCode}: #{res.body})"
+    console.log "sensu: User: #{msg.message.user.name}, sensu remove client #{client}"
+
+    if authorized
+      robot.http(config.sensu_api + '/clients/' + client)
+        .delete() (err, res, body) ->
+          if err
+            msg.send "Sensu says: #{err}"
+            return
+          if res.statusCode is 202
+            msg.send client + ' removed'
+          else if res.statusCode is 404
+            msg.send client + ' not found'
+          else
+            msg.send "API returned an error removing #{client} (#{res.statusCode}: #{res.body})"
+    else
+      msg.reply "I can't do that, you need at least one of these roles: #{authorizedRoles}"
 
 #######################
 #### Event methods ####
@@ -277,22 +314,30 @@ module.exports = (robot) ->
   robot.respond /(?:sensu)? resolve event (.*)(?:\/)(.*)/i, (msg) ->
     validateVars
     client = addClientDomain(msg.match[1])
+    check = msg.match[2]
 
     data = {}
     data['client'] = client
-    data['check'] = msg.match[2]
+    data['check'] = check
 
-    robot.http(config.sensu_api + '/resolve')
-      .post(JSON.stringify(data)) (err, res, body) ->
-        if err
-          msg.send "Sensu says: #{err}"
-          return
-        if res.statusCode is 202
-          msg.send 'Event resolved'
-        else if res.statusCode is 404
-          msg.send msg.match[1] + '/' + msg.match[2] + ' not found'
-        else
-          msg.send "API returned an error resolving #{msg.match[1]}/#{msg.match[2]} (#{res.statusCode}: #{res.body})"
+    authorized = isAuthorized robot, msg.envelope.user
+
+    console.log "sensu: User: #{msg.message.user.name}, sensu resolve event client: #{client}, check: #{check}"
+
+    if authorized
+      robot.http(config.sensu_api + '/resolve')
+        .post(JSON.stringify(data)) (err, res, body) ->
+          if err
+            msg.send "Sensu says: #{err}"
+            return
+          if res.statusCode is 202
+            msg.send 'Event resolved'
+          else if res.statusCode is 404
+            msg.send msg.match[1] + '/' + msg.match[2] + ' not found'
+          else
+            msg.send "API returned an error resolving #{msg.match[1]}/#{msg.match[2]} (#{res.statusCode}: #{res.body})"
+    else
+      msg.reply "I can't do that, you need at least one of these roles: #{authorizedRoles}"
 
 addClientDomain = (client) ->
   if process.env.HUBOT_SENSU_DOMAIN != undefined
